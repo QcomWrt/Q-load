@@ -71,8 +71,16 @@ jobs:
       - name: Display structure
         run: ls -R dist
 
+      - name: Prepare release files
+        run: |
+          mkdir release
+          find dist -type f -exec cp {} release/ \;
+
+      - name: Show release files
+        run: ls -lah release
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*
+          files: release/*
           generate_release_notes: true
