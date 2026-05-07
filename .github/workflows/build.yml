@@ -28,10 +28,6 @@ jobs:
           - goos: android
             goarch: arm64
             output: q-load-android-arm64
-          - goos: android
-            goarch: arm
-            goarm: 7
-            output: q-load-android-armv7
 
     steps:
       - name: Checkout source
