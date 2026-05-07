@@ -1,16 +1,19 @@
-name: Build Q-LOAD
+name: Manual Build and Release Q-LOAD
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (example: v1.0.0)"
+        required: true
+        default: "v1.0.0"
 
 jobs:
-  build:
-    name: Build q-load binaries
+  build-release:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
 
     strategy:
       matrix:
@@ -18,13 +21,16 @@ jobs:
           - goos: linux
             goarch: amd64
             output: q-load-linux-amd64
+
           - goos: linux
             goarch: arm64
             output: q-load-linux-arm64
+
           - goos: linux
             goarch: arm
             goarm: 7
             output: q-load-linux-armv7
+
           - goos: android
             goarch: arm64
             output: q-load-android-arm64
@@ -38,17 +44,54 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: Build
+      - name: Build binary
         env:
           CGO_ENABLED: 0
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
         run: |
-          go build -ldflags="-s -w" -o ${{ matrix.output }} main.go
+          mkdir -p release
+          go build -ldflags="-s -w" -o release/${{ matrix.output }} main.go
 
-      - name: Upload artifact
+      - name: Upload temporary artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.output }}
-          path: ${{ matrix.output }}
+          path: release/${{ matrix.output }}
+
+  release:
+    needs: build-release
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+
+      - name: Flatten binaries
+        run: |
+          mkdir final
+          find release -type f -exec cp {} final/ \;
+
+      - name: Show final files
+        run: ls -lah final
+
+      - name: Create Git tag
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git tag ${{ github.event.inputs.version }}
+          git push origin ${{ github.event.inputs.version }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          files: final/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
