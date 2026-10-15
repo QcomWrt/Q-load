@@ -42,7 +42,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.24'
 
       - name: Build binary
         env:
@@ -68,6 +68,9 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
       - name: Download all built binaries
         uses: actions/download-artifact@v4
         with:
@@ -83,8 +86,8 @@ jobs:
 
       - name: Create Git tag
         run: |
-          git config user.name github-actions
-          git config user.email github-actions@github.com
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag ${{ github.event.inputs.version }}
           git push origin ${{ github.event.inputs.version }}
 
