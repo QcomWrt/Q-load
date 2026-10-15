@@ -6,7 +6,7 @@ import (
 	"os"
 
 	// Import sub-package balance dari modul q-load
-	"github.com/QcomWrt/q-load/balance"
+	"github.com/QcomWrt/Q-load/balance"
 )
 
 func main() {
