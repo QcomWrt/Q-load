@@ -23,6 +23,7 @@ var (
 	rrCount  uint64
 )
 
+// Start diekspor agar bisa dipanggil oleh main.go maupun qtuncore
 func Start(lport string, tunnels []string) {
 	if lport == "" || len(tunnels) == 0 {
 		log.Println("[Q-LOAD] Error: lport atau tunnels kosong")

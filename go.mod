@@ -1,3 +1,3 @@
-module github.com/QcomWrt/q-load
+module github.com/QcomWrt/Q-load
 
 go 1.27.1
