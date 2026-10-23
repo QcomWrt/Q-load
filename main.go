@@ -1,4 +1,4 @@
-//Q-load
+// Q-load
 // main.go
 package main
 

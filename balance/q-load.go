@@ -1,7 +1,7 @@
-// balance/q-load.go
 package balance
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -9,189 +9,325 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type Backend struct {
 	Addr  string
-	Alive bool
+	alive atomic.Bool
 }
 
-var (
+type LoadBalancer struct {
 	backends []*Backend
-	rrCount  uint64
-)
+	rrCount  atomic.Uint64
 
-// Start diekspor agar bisa dipanggil oleh main.go maupun qtuncore
+	mu       sync.Mutex
+	listener net.Listener
+	clients  map[net.Conn]struct{}
+}
+
 func Start(lport string, tunnels []string) {
+	if err := StartContext(context.Background(), lport, tunnels); err != nil {
+		log.Printf("[Q-LOAD] stopped: %v", err)
+	}
+}
+
+// StartContext berjalan sampai context dibatalkan atau terjadi kesalahan listener.
+func StartContext(ctx context.Context, lport string, tunnels []string) error {
+	if ctx == nil {
+		return errors.New("context tidak boleh nil")
+	}
 	if lport == "" || len(tunnels) == 0 {
-		log.Println("[Q-LOAD] Error: lport atau tunnels kosong")
-		return
+		return errors.New("lport atau tunnels kosong")
 	}
 
-	backends = nil // Reset slice backend jika di-restart
-	for _, t := range tunnels {
-		backends = append(backends, &Backend{
-			Addr: t,
-		})
+	lb := &LoadBalancer{
+		clients: make(map[net.Conn]struct{}),
+	}
+	for _, addr := range tunnels {
+		if addr == "" {
+			return errors.New("alamat backend kosong")
+		}
+		lb.backends = append(lb.backends, &Backend{Addr: addr})
 	}
 
-	go healthLoop()
-
-	listenAddr := "127.0.0.1:" + lport
+	listenAddr := net.JoinHostPort("127.0.0.1", lport)
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Printf("[Q-LOAD] Listen error: %v", err)
-		return
+		return fmt.Errorf("listen %s: %w", listenAddr, err)
 	}
 
-	log.Printf("[Q-LOAD] Listening on %s with %d tunnels", listenAddr, len(backends))
+	lb.listener = ln
+	log.Printf("[Q-LOAD] Listening on %s with %d tunnels", listenAddr, len(lb.backends))
+
+	var wg sync.WaitGroup
+	healthCtx, cancelHealth := context.WithCancel(ctx)
+	defer cancelHealth()
+
+	// Memastikan pembatalan context membangunkan Accept().
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = ln.Close()
+		lb.closeClients()
+	})
+	defer stopClose()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		lb.healthLoop(healthCtx)
+	}()
 
 	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			continue
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			if ctx.Err() != nil {
+				break
+			}
+			_ = ln.Close()
+			cancelHealth()
+			wg.Wait()
+			return fmt.Errorf("accept: %w", acceptErr)
 		}
-		go handleClient(conn)
+
+		if ctx.Err() != nil {
+			_ = conn.Close()
+			break
+		}
+
+		lb.mu.Lock()
+		lb.clients[conn] = struct{}{}
+		lb.mu.Unlock()
+
+		wg.Add(1)
+		go func(c net.Conn) {
+			defer wg.Done()
+			defer func() {
+				lb.mu.Lock()
+				delete(lb.clients, c)
+				lb.mu.Unlock()
+				_ = c.Close()
+			}()
+			lb.handleClient(healthCtx, c)
+		}(conn)
+	}
+
+	cancelHealth()
+	_ = ln.Close()
+	lb.closeClients()
+	wg.Wait()
+
+	log.Printf("[Q-LOAD] stopped")
+	return nil
+}
+
+func (lb *LoadBalancer) closeClients() {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	for conn := range lb.clients {
+		_ = conn.Close()
 	}
 }
 
-func healthLoop() {
-	for {
-		for _, be := range backends {
-			c, err := net.DialTimeout("tcp", be.Addr, 3*time.Second)
+func (lb *LoadBalancer) healthLoop(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	check := func() {
+		alive := 0
+		for _, backend := range lb.backends {
+			if ctx.Err() != nil {
+				return
+			}
+			conn, err := net.DialTimeout("tcp", backend.Addr, 3*time.Second)
 			if err != nil {
-				be.Alive = false
+				backend.alive.Store(false)
 				continue
 			}
-			be.Alive = true
-			_ = c.Close()
+			backend.alive.Store(true)
+			alive++
+			_ = conn.Close()
 		}
+		log.Printf("[HEALTH] alive=%d/%d", alive, len(lb.backends))
+	}
 
-		alive := 0
-		for _, be := range backends {
-			if be.Alive {
-				alive++
-			}
+	check()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			check()
 		}
-
-		log.Printf("[HEALTH] alive=%d/%d", alive, len(backends))
-		time.Sleep(10 * time.Second)
 	}
 }
 
-func selectBackend() *Backend {
-	var alive []*Backend
-
-	for _, be := range backends {
-		if be.Alive {
-			alive = append(alive, be)
+func (lb *LoadBalancer) selectBackend() *Backend {
+	alive := make([]*Backend, 0, len(lb.backends))
+	for _, backend := range lb.backends {
+		if backend.alive.Load() {
+			alive = append(alive, backend)
 		}
 	}
-
 	if len(alive) == 0 {
 		return nil
 	}
-
-	idx := atomic.AddUint64(&rrCount, 1)
-	return alive[int(idx)%len(alive)]
+	idx := lb.rrCount.Add(1) - 1
+	return alive[idx%uint64(len(alive))]
 }
 
-func handleClient(client net.Conn) {
-	defer client.Close()
+func (lb *LoadBalancer) handleClient(ctx context.Context, client net.Conn) {
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = client.Close()
+	})
+	defer stopClose()
 
 	target, err := socks5Handshake(client)
 	if err != nil {
 		return
 	}
 
-	backend := selectBackend()
+	backend := lb.selectBackend()
 	if backend == nil {
-		log.Printf("[ERROR] no backend alive")
+		// Balasan gagal: koneksi ke backend tidak tersedia.
+		_, _ = client.Write([]byte{
+			0x05, 0x04, 0x00, 0x01,
+			0, 0, 0, 0, 0, 0,
+		})
+		log.Printf("[Q-LOAD] no backend alive")
 		return
 	}
 
 	remote, err := socks5Dial(backend.Addr, target)
 	if err != nil {
-		log.Printf("[ERROR] backend failed %s", backend.Addr)
-		backend.Alive = false
+		_, _ = client.Write([]byte{
+			0x05, 0x01, 0x00, 0x01,
+			0, 0, 0, 0, 0, 0,
+		})
+		log.Printf("[Q-LOAD] backend failed %s: %v", backend.Addr, err)
+		backend.alive.Store(false)
 		return
 	}
 	defer remote.Close()
 
+	// Kirim balasan sukses hanya setelah backend terhubung.
+	if _, err := client.Write([]byte{
+		0x05, 0x00, 0x00, 0x01,
+		0, 0, 0, 0, 0, 0,
+	}); err != nil {
+		return
+	}
+
 	log.Printf("[CONNECT] %s via %s", target, backend.Addr)
 
-	go io.Copy(remote, client)
-	io.Copy(client, remote)
+	errCh := make(chan struct{}, 2)
+
+	go func() {
+		_, _ = io.Copy(remote, client)
+		errCh <- struct{}{}
+	}()
+
+	go func() {
+		_, _ = io.Copy(client, remote)
+		errCh <- struct{}{}
+	}()
+
+	select {
+	case <-ctx.Done():
+	case <-errCh:
+	}
+
+	// Tutup kedua koneksi agar goroutine relay tidak tertahan.
+	_ = client.Close()
+	_ = remote.Close()
 }
 
 func socks5Handshake(conn net.Conn) (string, error) {
 	buf := make([]byte, 262)
 
-	_, err := io.ReadFull(conn, buf[:2])
-	if err != nil {
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
 		return "", err
+	}
+	if buf[0] != 0x05 {
+		return "", errors.New("invalid SOCKS version")
 	}
 
 	nMethods := int(buf[1])
-	_, err = io.ReadFull(conn, buf[:nMethods])
-	if err != nil {
+	if nMethods == 0 {
+		return "", errors.New("no SOCKS authentication methods")
+	}
+	if _, err := io.ReadFull(conn, buf[:nMethods]); err != nil {
 		return "", err
 	}
 
-	_, err = conn.Write([]byte{0x05, 0x00})
-	if err != nil {
+	hasNoAuth := false
+	for _, method := range buf[:nMethods] {
+		if method == 0x00 {
+			hasNoAuth = true
+			break
+		}
+	}
+
+	if !hasNoAuth {
+		_, _ = conn.Write([]byte{0x05, 0xFF})
+		return "", errors.New("no supported SOCKS authentication method")
+	}
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
 		return "", err
 	}
 
-	_, err = io.ReadFull(conn, buf[:4])
-	if err != nil {
+	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
 		return "", err
 	}
-
-	if buf[1] != 0x01 {
-		return "", errors.New("only connect supported")
+	if buf[0] != 0x05 || buf[1] != 0x01 {
+		return "", errors.New("only SOCKS CONNECT is supported")
 	}
 
-	atyp := buf[3]
 	var host string
 
-	switch atyp {
+	switch buf[3] {
 	case 0x01:
-		_, err = io.ReadFull(conn, buf[:4])
-		if err != nil {
+		if _, err := io.ReadFull(conn, buf[:4]); err != nil {
 			return "", err
 		}
 		host = net.IP(buf[:4]).String()
 
 	case 0x03:
-		_, err = io.ReadFull(conn, buf[:1])
-		if err != nil {
+		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
 			return "", err
 		}
-		l := int(buf[0])
-		_, err = io.ReadFull(conn, buf[:l])
-		if err != nil {
+		n := int(buf[0])
+		if n == 0 {
+			return "", errors.New("empty domain")
+		}
+		if _, err := io.ReadFull(conn, buf[:n]); err != nil {
 			return "", err
 		}
-		host = string(buf[:l])
+		host = string(buf[:n])
+
+	case 0x04:
+		if _, err := io.ReadFull(conn, buf[:16]); err != nil {
+			return "", err
+		}
+		host = net.IP(buf[:16]).String()
 
 	default:
-		return "", errors.New("unsupported atyp")
+		return "", errors.New("unsupported SOCKS address type")
 	}
 
-	_, err = io.ReadFull(conn, buf[:2])
-	if err != nil {
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
 		return "", err
 	}
 
 	port := binary.BigEndian.Uint16(buf[:2])
+	if port == 0 {
+		return "", errors.New("invalid destination port")
+	}
 
-	reply := []byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
-	_, _ = conn.Write(reply)
-
-	return fmt.Sprintf("%s:%d", host, port), nil
+	// Belum mengirim balasan CONNECT sukses di sini.
+	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
 }
 
 func socks5Dial(proxyAddr, target string) (net.Conn, error) {
@@ -200,34 +336,45 @@ func socks5Dial(proxyAddr, target string) (net.Conn, error) {
 		return nil, err
 	}
 
-	_, err = conn.Write([]byte{0x05, 0x01, 0x00})
-	if err != nil {
-		conn.Close()
+	fail := func(err error) (net.Conn, error) {
+		_ = conn.Close()
 		return nil, err
 	}
 
+	if _, err = conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		return fail(err)
+	}
+
 	buf := make([]byte, 2)
-	_, err = io.ReadFull(conn, buf)
-	if err != nil || buf[1] != 0x00 {
-		conn.Close()
-		return nil, errors.New("auth fail")
+	if _, err = io.ReadFull(conn, buf); err != nil {
+		return fail(err)
+	}
+	if buf[0] != 0x05 || buf[1] != 0x00 {
+		return fail(errors.New("backend SOCKS authentication failed"))
 	}
 
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
-		conn.Close()
-		return nil, err
+		return fail(err)
+	}
+	portNum, err := strconv.Atoi(portStr)
+	if err != nil || portNum < 1 || portNum > 65535 {
+		return fail(errors.New("invalid destination port"))
 	}
 
-	portNum, _ := strconv.Atoi(portStr)
-
 	req := []byte{0x05, 0x01, 0x00}
-
 	ip := net.ParseIP(host)
+
 	if ip4 := ip.To4(); ip4 != nil {
 		req = append(req, 0x01)
 		req = append(req, ip4...)
+	} else if ip6 := ip.To16(); ip6 != nil {
+		req = append(req, 0x04)
+		req = append(req, ip6...)
 	} else {
+		if len(host) == 0 || len(host) > 255 {
+			return fail(errors.New("invalid domain length"))
+		}
 		req = append(req, 0x03, byte(len(host)))
 		req = append(req, []byte(host)...)
 	}
@@ -236,16 +383,34 @@ func socks5Dial(proxyAddr, target string) (net.Conn, error) {
 	binary.BigEndian.PutUint16(pb, uint16(portNum))
 	req = append(req, pb...)
 
-	_, err = conn.Write(req)
-	if err != nil {
-		conn.Close()
-		return nil, err
+	if _, err = conn.Write(req); err != nil {
+		return fail(err)
 	}
 
-	_, err = io.ReadFull(conn, make([]byte, 10))
+	// Membaca header reply dan address sesuai tipe yang dikirim backend.
+	header := make([]byte, 4)
+	if _, err = io.ReadFull(conn, header); err != nil {
+		return fail(err)
+	}
+	if header[0] != 0x05 || header[1] != 0x00 {
+		return fail(fmt.Errorf("backend SOCKS CONNECT failed: reply=%d", header[1]))
+	}
+
+	switch header[3] {
+	case 0x01:
+		_, err = io.CopyN(io.Discard, conn, 4+2)
+	case 0x03:
+		var n [1]byte
+		if _, err = io.ReadFull(conn, n[:]); err == nil {
+			_, err = io.CopyN(io.Discard, conn, int64(n[0])+2)
+		}
+	case 0x04:
+		_, err = io.CopyN(io.Discard, conn, 16+2)
+	default:
+		err = errors.New("invalid backend SOCKS reply address type")
+	}
 	if err != nil {
-		conn.Close()
-		return nil, err
+		return fail(err)
 	}
 
 	return conn, nil
