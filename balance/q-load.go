@@ -87,7 +87,7 @@ func StartContextWithOptions(
 		}
 
 		backend := &Backend{Addr: addr}
-		backend.alive.Store(true)
+		backend.alive.Store(opts.Control == nil)
 		lb.backends = append(lb.backends, backend)
 	}
 
