@@ -29,6 +29,8 @@ type Options struct {
 	// UDPDNS mengaktifkan UDP ASSOCIATE untuk query DNS (port 53),
 	// yang diteruskan lewat DNS over TCP ke backend.
 	UDPDNS bool
+	// Control opsional, untuk mengatur status backend saat berjalan.
+	Control *Control
 }
 
 type Backend struct {
@@ -87,6 +89,11 @@ func StartContextWithOptions(
 		backend := &Backend{Addr: addr}
 		backend.alive.Store(true)
 		lb.backends = append(lb.backends, backend)
+	}
+
+	if opts.Control != nil {
+		opts.Control.attach(lb)
+		defer opts.Control.detach()
 	}
 
 	listenAddr := net.JoinHostPort("127.0.0.1", lport)
